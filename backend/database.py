@@ -14,7 +14,18 @@ import os
 from datetime import datetime
 from contextlib import contextmanager
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "data", "attendance.db")
+if os.environ.get("VERCEL"):
+    DB_DIR = "/tmp/data"
+    os.makedirs(DB_DIR, exist_ok=True)
+    DB_PATH = os.path.join(DB_DIR, "attendance.db")
+    # Copy seed DB if not yet present in /tmp
+    seed_db = os.path.join(os.path.dirname(__file__), "data", "attendance.db")
+    if not os.path.exists(DB_PATH) and os.path.exists(seed_db):
+        import shutil
+        shutil.copyfile(seed_db, DB_PATH)
+else:
+    DB_DIR = os.path.join(os.path.dirname(__file__), "data")
+    DB_PATH = os.path.join(DB_DIR, "attendance.db")
 
 
 def init_db():

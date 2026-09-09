@@ -28,8 +28,12 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 import sys
 if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
-STUDENT_PHOTO_DIR = os.path.join(BASE_DIR, "data", "student_photos")
-SESSION_PHOTO_DIR = os.path.join(BASE_DIR, "data", "session_photos")
+if os.environ.get("VERCEL"):
+    STUDENT_PHOTO_DIR = "/tmp/student_photos"
+    SESSION_PHOTO_DIR = "/tmp/session_photos"
+else:
+    STUDENT_PHOTO_DIR = os.path.join(BASE_DIR, "data", "student_photos")
+    SESSION_PHOTO_DIR = os.path.join(BASE_DIR, "data", "session_photos")
 FRONTEND_DIR = os.path.join(os.path.dirname(BASE_DIR), "frontend")
 
 DEFAULT_THRESHOLD = 0.35  # Cosine similarity threshold for ResNet50 ArcFace (buffalo_l)
