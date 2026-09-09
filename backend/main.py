@@ -24,7 +24,10 @@ from pydantic import BaseModel
 import database as db
 import face_engine
 
-BASE_DIR = os.path.dirname(__file__)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+import sys
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
 STUDENT_PHOTO_DIR = os.path.join(BASE_DIR, "data", "student_photos")
 SESSION_PHOTO_DIR = os.path.join(BASE_DIR, "data", "session_photos")
 FRONTEND_DIR = os.path.join(os.path.dirname(BASE_DIR), "frontend")
