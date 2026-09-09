@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Smart Attendance System (Face Recognition)
 
 A self-contained, working attendance system that:
@@ -50,3 +51,6 @@ This uses SQLite + brute-force cosine similarity, which comfortably handles a sc
 ## Privacy note
 
 This system stores biometric data (face photos and embeddings) tied to real students. Before deploying it in a real school, make sure you have appropriate consent and comply with your local student-data privacy regulations (e.g. FERPA in the US, or equivalent local laws).
+=======
+# smart-attendance-system
+>>>>>>> 0a5b9477e96e88daa57c172aed3cf978c135ee7e
