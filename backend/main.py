@@ -49,6 +49,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+from starlette.types import ASGIApp, Scope, Receive, Send
+
+class AutoApiPrefixMiddleware:
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send):
+        if scope["type"] == "http":
+            path = scope.get("path", "")
+            if path and not path.startswith("/api"):
+                scope["path"] = "/api" + path
+        await self.app(scope, receive, send)
+
+app.add_middleware(AutoApiPrefixMiddleware)
+
 
 @app.on_event("startup")
 def startup():
