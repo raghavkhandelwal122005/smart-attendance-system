@@ -1,4 +1,4 @@
-const API = ""; // Same origin
+const API = window.API_URL || localStorage.getItem("API_URL") || ""; // Same origin by default, or configurable backend URL
 
 // State variables
 let regPhotos = [];
