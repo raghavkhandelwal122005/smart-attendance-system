@@ -52,10 +52,15 @@ app.add_middleware(
 
 @app.on_event("startup")
 def startup():
-    db.init_db()
-    db.seed_demo_data()
-    # Warm up InsightFace detector & recognizer on startup
-    face_engine.get_face_app()
+    try:
+        db.init_db()
+        db.seed_demo_data()
+    except Exception as err:
+        print(f"[STARTUP NOTICE] DB seed skipped: {err}")
+    try:
+        face_engine.get_face_app()
+    except Exception as err:
+        print(f"[STARTUP NOTICE] Face engine warmup skipped: {err}")
 
 
 @app.get("/api/stats")
@@ -345,4 +350,5 @@ def export_csv(session_id: int):
     )
 
 
-app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")
+if os.path.exists(FRONTEND_DIR) and not os.environ.get("VERCEL"):
+    app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")

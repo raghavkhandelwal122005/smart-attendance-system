@@ -16,28 +16,24 @@ import database as db
 import face_engine
 
 BASE_DIR = os.path.dirname(__file__)
-USER_UPLOAD_PHOTO = r"C:\Users\LENOVO\.gemini\antigravity\brain\25bec080-1232-4ce6-ada0-2f032d293735\.user_uploaded\media_1788917238154.jpg"
-DATA_DIR = os.path.join(BASE_DIR, "data")
-TARGET_DEMO_PHOTO = os.path.join(DATA_DIR, "demo_classroom_60.jpg")
-STUDENT_PHOTO_DIR = os.path.join(DATA_DIR, "student_photos")
+DATA_DIR = getattr(db, "DB_DIR", os.path.join(BASE_DIR, "data"))
+TARGET_DEMO_PHOTO = os.path.join(BASE_DIR, "data", "demo_classroom_60.jpg")
+STUDENT_PHOTO_DIR = getattr(db, "STUDENT_PHOTO_DIR", os.path.join(DATA_DIR, "student_photos"))
 
 
 def seed_real_students():
-    os.makedirs(DATA_DIR, exist_ok=True)
-    os.makedirs(STUDENT_PHOTO_DIR, exist_ok=True)
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        os.makedirs(STUDENT_PHOTO_DIR, exist_ok=True)
 
-    # 1. Copy user real classroom photo to demo_classroom_60.jpg
-    if os.path.exists(USER_UPLOAD_PHOTO):
-        shutil.copy(USER_UPLOAD_PHOTO, TARGET_DEMO_PHOTO)
-        print(f"Copied real classroom photo to {TARGET_DEMO_PHOTO}")
-    elif not os.path.exists(TARGET_DEMO_PHOTO):
-        raise FileNotFoundError(f"Classroom photo not found at {USER_UPLOAD_PHOTO}")
+        if not os.path.exists(TARGET_DEMO_PHOTO):
+            print(f"[SEED NOTICE] Demo classroom photo not found at {TARGET_DEMO_PHOTO}. Skipping auto-seed.")
+            return {"ok": False, "reason": "Demo classroom photo not found"}
 
-    # 2. Load image and run InsightFace detector
-    with open(TARGET_DEMO_PHOTO, "rb") as f:
-        raw_bytes = f.read()
+        with open(TARGET_DEMO_PHOTO, "rb") as f:
+            raw_bytes = f.read()
 
-    image_rgb = face_engine.load_image_from_bytes(raw_bytes)
+        image_rgb = face_engine.load_image_from_bytes(raw_bytes)
     # Detect all real student faces in classroom photo
     faces = face_engine.detect_faces(image_rgb, det_thresh=0.20)
     print(f"Detected {len(faces)} real human student faces in classroom photo.")
@@ -101,8 +97,11 @@ def seed_real_students():
         db.add_embedding(sid, face["embedding"], crop_path, face["det_score"])
         seeded_count += 1
 
-    print(f"Successfully registered {seeded_count} real students into database!")
-    return {"ok": True, "seeded_students": seeded_count, "faces_detected": len(faces)}
+        print(f"Successfully registered {seeded_count} real students into database!")
+        return {"ok": True, "seeded_students": seeded_count, "faces_detected": len(faces)}
+    except Exception as err:
+        print(f"[SEED ERROR] {err}")
+        return {"ok": False, "error": str(err)}
 
 
 if __name__ == "__main__":
