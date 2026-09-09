@@ -78,6 +78,24 @@ def init_db():
             """
         )
 
+        student_count = conn.execute("SELECT COUNT(*) FROM students").fetchone()[0]
+        if student_count == 0:
+            try:
+                import database_seed
+                for s in database_seed.SEED_STUDENTS:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO students (student_id, name, class_name, created_at) VALUES (?, ?, ?, ?)",
+                        (s["student_id"], s["name"], s.get("class_name", ""), s.get("created_at", datetime.utcnow().isoformat()))
+                    )
+                for e in database_seed.SEED_EMBEDDINGS:
+                    conn.execute(
+                        "INSERT INTO face_embeddings (student_id, embedding, photo_path, det_score, created_at) VALUES (?, ?, ?, ?, ?)",
+                        (e["student_id"], e["embedding"], e.get("photo_path", ""), e.get("det_score", 0.95), e.get("created_at", datetime.utcnow().isoformat()))
+                    )
+                print(f"[DB INIT] Auto-seeded {len(database_seed.SEED_STUDENTS)} students into database!")
+            except Exception as err:
+                print(f"[DB INIT NOTICE] Seed loading error: {err}")
+
 
 @contextmanager
 def get_conn():
