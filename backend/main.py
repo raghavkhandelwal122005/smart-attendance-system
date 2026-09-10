@@ -1,10 +1,14 @@
 """
 main.py
 -------
-FastAPI application for Smart Attendance System:
-  - Face Database Management & Embeddings
-  - Multi-Student Face Recognition with Global Ranked Assignment
-  - Attendance Verification, Finalization & CSV Export
+FastAPI application — Smart Attendance System.
+
+Production notes:
+- AutoApiPrefixMiddleware has been REMOVED. Vercel routes /api/* to this app;
+  FastAPI already receives paths like /api/stats, so double-prefixing must not happen.
+- startup() calls init_db() only. It does NOT seed demo data — that is an explicit
+  user action via POST /api/demo/seed. This prevents cold-starts from wiping the DB.
+- Demo classroom photo is written to /tmp on Vercel (writable directory).
 """
 
 import os
@@ -16,32 +20,23 @@ from typing import List, Optional
 
 import numpy as np
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 import database as db
 import face_engine
+import storage
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-import sys
-if BASE_DIR not in sys.path:
-    sys.path.insert(0, BASE_DIR)
-if os.environ.get("VERCEL"):
-    STUDENT_PHOTO_DIR = "/tmp/student_photos"
-    SESSION_PHOTO_DIR = "/tmp/session_photos"
-else:
-    STUDENT_PHOTO_DIR = os.path.join(BASE_DIR, "data", "student_photos")
-    SESSION_PHOTO_DIR = os.path.join(BASE_DIR, "data", "session_photos")
 FRONTEND_DIR = os.path.join(os.path.dirname(BASE_DIR), "frontend")
+IS_VERCEL = bool(os.environ.get("VERCEL"))
 
-DEFAULT_THRESHOLD = 0.35  # Cosine similarity threshold for ResNet50 ArcFace (buffalo_l)
-
-os.makedirs(STUDENT_PHOTO_DIR, exist_ok=True)
-os.makedirs(SESSION_PHOTO_DIR, exist_ok=True)
+DEFAULT_THRESHOLD = 0.35  # Cosine similarity threshold for buffalo_sc ArcFace
 
 app = FastAPI(title="Smart Attendance System")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -49,34 +44,27 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-from starlette.types import ASGIApp, Scope, Receive, Send
-
-class AutoApiPrefixMiddleware:
-    def __init__(self, app: ASGIApp):
-        self.app = app
-
-    async def __call__(self, scope: Scope, receive: Receive, send: Send):
-        if scope["type"] == "http":
-            path = scope.get("path", "")
-            if path and not path.startswith("/api"):
-                scope["path"] = "/api" + path
-        await self.app(scope, receive, send)
-
-app.add_middleware(AutoApiPrefixMiddleware)
-
 
 @app.on_event("startup")
 def startup():
+    # Only initialise schema / seed static data — never wipe or re-seed existing rows.
     try:
         db.init_db()
-        db.seed_demo_data()
+        print("[STARTUP] Database ready.")
     except Exception as err:
-        print(f"[STARTUP NOTICE] DB seed skipped: {err}")
+        print(f"[STARTUP ERROR] Database init failed: {err}")
+
+    # Warm up the InsightFace model so the first request isn't slow
     try:
         face_engine.get_face_app()
+        print("[STARTUP] Face engine ready.")
     except Exception as err:
-        print(f"[STARTUP NOTICE] Face engine warmup skipped: {err}")
+        print(f"[STARTUP WARNING] Face engine warmup skipped: {err}")
 
+
+# ---------------------------------------------------------------------------
+# Dashboard & demo
+# ---------------------------------------------------------------------------
 
 @app.get("/api/stats")
 def get_dashboard_stats():
@@ -85,28 +73,41 @@ def get_dashboard_stats():
 
 @app.post("/api/demo/seed")
 def seed_demo():
+    """
+    Trigger the real-classroom seeder. Loads demo_classroom_60.jpg (generated
+    on-the-fly if absent), detects faces with InsightFace, stores real ArcFace
+    embeddings in the database. No-ops if students already exist.
+    """
     return db.seed_demo_data()
 
 
 @app.get("/api/demo/classroom-photo")
 def get_demo_classroom_photo():
-    demo_path = os.path.join(BASE_DIR, "data", "demo_classroom_60.jpg")
+    """
+    Serve demo_classroom_60.jpg. Generates it if not yet present.
+    On Vercel writes to /tmp; locally writes to backend/data/.
+    """
+    if IS_VERCEL:
+        demo_path = "/tmp/demo_classroom_60.jpg"
+    else:
+        demo_path = os.path.join(BASE_DIR, "data", "demo_classroom_60.jpg")
+
     if not os.path.exists(demo_path):
         import generate_demo_photo
-        generate_demo_photo.generate_classroom_photo()
+        generate_demo_photo.generate_classroom_photo(output_path=demo_path)
+
     with open(demo_path, "rb") as f:
         data = f.read()
+
     return StreamingResponse(
         io.BytesIO(data),
         media_type="image/jpeg",
-        headers={"Content-Disposition": "inline; filename=demo_classroom_60.jpg"}
+        headers={"Content-Disposition": "inline; filename=demo_classroom_60.jpg"},
     )
 
 
-
-
 # ---------------------------------------------------------------------------
-# Students / Face Database
+# Students / face database
 # ---------------------------------------------------------------------------
 
 @app.post("/api/students")
@@ -118,16 +119,12 @@ async def register_student(
 ):
     if db.student_exists(student_id):
         raise HTTPException(400, f"Student ID '{student_id}' already exists.")
-    if len(photos) < 1:
+    if not photos:
         raise HTTPException(400, "At least one photo is required.")
 
     db.add_student(student_id, name, class_name)
 
-    student_dir = os.path.join(STUDENT_PHOTO_DIR, student_id)
-    os.makedirs(student_dir, exist_ok=True)
-
-    saved = 0
-    skipped = []
+    saved, skipped = 0, []
     for photo in photos:
         raw = await photo.read()
         try:
@@ -137,11 +134,11 @@ async def register_student(
             continue
 
         faces = face_engine.detect_faces(image_rgb, det_thresh=0.25)
-        if len(faces) == 0:
+        if not faces:
             skipped.append({"file": photo.filename, "reason": "no face detected"})
             continue
         if len(faces) > 1:
-            # Registration photo: select largest face
+            # Select the largest face for registration photos
             faces.sort(
                 key=lambda f: (f["bbox"][2] - f["bbox"][0]) * (f["bbox"][3] - f["bbox"][1]),
                 reverse=True,
@@ -149,19 +146,19 @@ async def register_student(
 
         face = faces[0]
         filename = f"{uuid.uuid4().hex}.jpg"
-        path = os.path.join(student_dir, filename)
-        from PIL import Image
-        Image.fromarray(image_rgb).save(path, "JPEG", quality=90)
+        photo_ref = f"{student_id}/{filename}"
 
-        db.add_embedding(student_id, face["embedding"], path, face["det_score"])
+        img_buf = io.BytesIO()
+        from PIL import Image
+        Image.fromarray(image_rgb).save(img_buf, format="JPEG", quality=90)
+        saved_path = storage.save_photo(img_buf.getvalue(), photo_ref, kind="student")
+
+        db.add_embedding(student_id, face["embedding"], saved_path, face["det_score"])
         saved += 1
 
     if saved == 0:
         db.delete_student(student_id)
-        raise HTTPException(
-            400,
-            f"Could not extract a face from any uploaded photo. Details: {skipped}",
-        )
+        raise HTTPException(400, f"No usable face found in any uploaded photo. Details: {skipped}")
 
     return {
         "student_id": student_id,
@@ -186,7 +183,7 @@ def remove_student(student_id: str):
 
 
 # ---------------------------------------------------------------------------
-# Sessions & Recognition
+# Sessions & attendance recognition
 # ---------------------------------------------------------------------------
 
 class SessionCreate(BaseModel):
@@ -223,29 +220,29 @@ async def recognize(
     except Exception:
         raise HTTPException(400, "Could not decode uploaded image.")
 
+    # Save session photo to persistent storage
     filename = f"{session_id}_{uuid.uuid4().hex}.jpg"
-    photo_path = os.path.join(SESSION_PHOTO_DIR, filename)
+    img_buf = io.BytesIO()
     from PIL import Image
-    Image.fromarray(image_rgb).save(photo_path, "JPEG", quality=90)
+    Image.fromarray(image_rgb).save(img_buf, format="JPEG", quality=90)
+    photo_path = storage.save_photo(img_buf.getvalue(), filename, kind="session")
 
-    # High resolution face detection with det_thresh=0.25 to catch every student face
+    # Detect faces and compute similarity against all stored embeddings
     faces = face_engine.detect_faces(image_rgb, det_thresh=0.25)
     gallery = db.get_gallery()
 
-    # Vectorized matrix similarity matching for enterprise scaling (1,000s of vectors)
     face_embeddings_list = [f["embedding"] for f in faces]
     face_sim_maps = face_engine.compute_student_similarities_vectorized(face_embeddings_list, gallery)
 
+    # Global greedy assignment: highest-similarity pairs first, each face/student claimed once
     all_pairs = []
     for face_idx, sim_map in enumerate(face_sim_maps):
         for sid, info in sim_map.items():
             all_pairs.append((info["max_score"], face_idx, sid, info["name"]))
-
-    # Sort candidates by similarity score descending
     all_pairs.sort(key=lambda p: p[0], reverse=True)
 
-    assigned_faces = {}     # face_idx -> (student_id, name, score)
-    claimed_students = set()
+    assigned_faces: dict = {}   # face_idx -> (student_id, name, score)
+    claimed_students: set = set()
 
     for score, face_idx, sid, name in all_pairs:
         if score < threshold:
@@ -254,17 +251,16 @@ async def recognize(
             assigned_faces[face_idx] = (sid, name, score)
             claimed_students.add(sid)
 
+    # Build results and persist attendance records
     results = []
     for face_idx, face in enumerate(faces):
         if face_idx in assigned_faces:
             sid, name, score = assigned_faces[face_idx]
             status = "present"
         else:
-            # Face wasn't matched to any database student above threshold
             sim_map = face_sim_maps[face_idx]
-            best_unmatched_score = max([info["max_score"] for info in sim_map.values()], default=0.0)
+            score = max((info["max_score"] for info in sim_map.values()), default=0.0)
             sid, name = None, None
-            score = best_unmatched_score
             status = "unknown"
 
         record_id = db.add_attendance_record(
@@ -277,17 +273,21 @@ async def recognize(
             source_photo=photo_path,
             verified=0,
         )
-        results.append(
-            {
-                "record_id": record_id,
-                "bbox": face["bbox"],
-                "det_score": round(face["det_score"], 4),
-                "student_id": sid,
-                "name": name,
-                "confidence": round(score, 4),
-                "status": status,
-            }
-        )
+        results.append({
+            "record_id": record_id,
+            "bbox": face["bbox"],
+            "det_score": round(face["det_score"], 4),
+            "student_id": sid,
+            "name": name,
+            "confidence": round(score, 4),
+            "status": status,
+        })
+
+    # photo_url: if cloud storage returned an https:// URL, use it directly
+    if photo_path.startswith("http"):
+        photo_url = photo_path
+    else:
+        photo_url = f"/api/photo?path={filename}&kind=session"
 
     return {
         "session_id": session_id,
@@ -296,25 +296,24 @@ async def recognize(
         "image_width": image_rgb.shape[1],
         "image_height": image_rgb.shape[0],
         "results": results,
-        "photo_url": f"/api/photo?path={filename}&kind=session",
+        "photo_url": photo_url,
     }
 
 
 @app.get("/api/photo")
 def get_photo(path: str, kind: str = "session"):
-    base = SESSION_PHOTO_DIR if kind == "session" else STUDENT_PHOTO_DIR
-    full = os.path.join(base, path)
-    if not os.path.abspath(full).startswith(os.path.abspath(base)):
-        raise HTTPException(400, "Invalid path")
-    if not os.path.exists(full):
-        raise HTTPException(404, "Not found")
-    with open(full, "rb") as f:
+    loc = storage.resolve_photo_location(path, kind=kind)
+    if not loc.get("exists"):
+        raise HTTPException(404, "Photo not found")
+    if loc.get("is_url"):
+        return RedirectResponse(url=loc["url"])
+    with open(loc["local_path"], "rb") as f:
         data = f.read()
     return StreamingResponse(io.BytesIO(data), media_type="image/jpeg")
 
 
 # ---------------------------------------------------------------------------
-# Teacher Verification & CSV Export
+# Teacher verification & CSV export
 # ---------------------------------------------------------------------------
 
 class RecordUpdate(BaseModel):
@@ -354,9 +353,7 @@ def export_csv(session_id: int):
     writer = csv.writer(buf)
     writer.writerow(["student_id", "name", "status", "confidence", "verified"])
     for r in records:
-        writer.writerow(
-            [r["student_id"], r["name"], r["status"], r["confidence"], r["verified"]]
-        )
+        writer.writerow([r["student_id"], r["name"], r["status"], r["confidence"], r["verified"]])
     buf.seek(0)
     return StreamingResponse(
         io.BytesIO(buf.getvalue().encode()),
@@ -365,5 +362,6 @@ def export_csv(session_id: int):
     )
 
 
-if os.path.exists(FRONTEND_DIR) and not os.environ.get("VERCEL"):
+# Serve frontend static files in local development (not on Vercel — handled by vercel.json)
+if os.path.exists(FRONTEND_DIR) and not IS_VERCEL:
     app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")

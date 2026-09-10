@@ -1,106 +1,138 @@
 """
 seed_real_classroom.py
 ----------------------
-Detects real student faces from uploaded classroom photo (media_1788917238154.jpg),
-crops individual face photos, extracts real 512-d ArcFace embeddings,
-and registers student profiles (including Gwen ID: 5) in SQLite database.
+Triggered by POST /api/demo/seed.
+Detects real student faces from demo_classroom_60.jpg (generated on-the-fly if absent),
+crops face thumbnails, stores real 512-d ArcFace embeddings in the database,
+and persists face crops via the storage layer.
+
+Guards:
+- Does NOT wipe existing students if the database is already populated.
+- Writes demo photo to /tmp on Vercel (writable) rather than backend/data/.
 """
 
 import os
-import shutil
-import uuid
+import io
 import numpy as np
 from PIL import Image
 
 import database as db
 import face_engine
+import storage
 
 BASE_DIR = os.path.dirname(__file__)
-DATA_DIR = getattr(db, "DB_DIR", os.path.join(BASE_DIR, "data"))
-TARGET_DEMO_PHOTO = os.path.join(BASE_DIR, "data", "demo_classroom_60.jpg")
-STUDENT_PHOTO_DIR = getattr(db, "STUDENT_PHOTO_DIR", os.path.join(DATA_DIR, "student_photos"))
+IS_VERCEL = bool(os.environ.get("VERCEL"))
+
+# Demo photo: use /tmp on Vercel (writable), local data/ dir otherwise
+_LOCAL_DEMO_PHOTO = os.path.join(BASE_DIR, "data", "demo_classroom_60.jpg")
+_TMP_DEMO_PHOTO   = "/tmp/demo_classroom_60.jpg"
+TARGET_DEMO_PHOTO = _TMP_DEMO_PHOTO if IS_VERCEL else _LOCAL_DEMO_PHOTO
+
+
+def _ensure_demo_photo() -> str:
+    """
+    Return a path to demo_classroom_60.jpg, generating it if necessary.
+    On Vercel we always write to /tmp; locally we prefer backend/data/.
+    """
+    if os.path.exists(TARGET_DEMO_PHOTO):
+        return TARGET_DEMO_PHOTO
+
+    # Try the other location (e.g. local data/ exists but /tmp doesn't yet)
+    alt = _LOCAL_DEMO_PHOTO if IS_VERCEL else _TMP_DEMO_PHOTO
+    if os.path.exists(alt):
+        import shutil
+        os.makedirs(os.path.dirname(TARGET_DEMO_PHOTO), exist_ok=True)
+        shutil.copy2(alt, TARGET_DEMO_PHOTO)
+        return TARGET_DEMO_PHOTO
+
+    # Generate fresh
+    import generate_demo_photo
+    return generate_demo_photo.generate_classroom_photo(output_path=TARGET_DEMO_PHOTO)
 
 
 def seed_real_students():
     try:
-        os.makedirs(DATA_DIR, exist_ok=True)
-        os.makedirs(STUDENT_PHOTO_DIR, exist_ok=True)
+        # Guard: do not wipe an already-populated database
+        stats = db.get_stats()
+        if stats["total_students"] > 0:
+            return {
+                "ok": True,
+                "message": "Database already has students — skipping re-seed to protect existing data.",
+                "total_students": stats["total_students"],
+            }
 
-        if not os.path.exists(TARGET_DEMO_PHOTO):
-            print(f"[SEED NOTICE] Demo classroom photo not found at {TARGET_DEMO_PHOTO}. Skipping auto-seed.")
-            return {"ok": False, "reason": "Demo classroom photo not found"}
+        demo_photo_path = _ensure_demo_photo()
 
-        with open(TARGET_DEMO_PHOTO, "rb") as f:
+        with open(demo_photo_path, "rb") as f:
             raw_bytes = f.read()
 
         image_rgb = face_engine.load_image_from_bytes(raw_bytes)
-    # Detect all real student faces in classroom photo
-    faces = face_engine.detect_faces(image_rgb, det_thresh=0.20)
-    print(f"Detected {len(faces)} real human student faces in classroom photo.")
+        faces = face_engine.detect_faces(image_rgb, det_thresh=0.20)
+        print(f"[SEED] Detected {len(faces)} faces in demo classroom photo.")
 
-    if len(faces) == 0:
-        print("Warning: No faces detected in classroom photo.")
-        return {"ok": False, "reason": "No faces detected"}
+        if len(faces) == 0:
+            return {"ok": False, "reason": "No faces detected in demo classroom photo."}
 
-    # Sort faces by spatial position (top-to-bottom, left-to-right rows)
-    faces.sort(key=lambda f: (f["bbox"][1] // 120, f["bbox"][0]))
+        # Sort spatially: top-to-bottom rows, left-to-right within each row
+        faces.sort(key=lambda f: (f["bbox"][1] // 120, f["bbox"][0]))
 
-    student_names = [
-        "gwen", "Aarav Sharma", "Sophia Chen", "Liam Johnson", "Noah Smith",
-        "Emma Watson", "Lucas Brown", "Olivia Garcia", "Ethan Miller", "Ava Davis",
-        "Mason Rodriguez", "Isabella Martinez", "William Hernandez", "Mia Lopez", "James Gonzalez",
-        "Charlotte Wilson", "Benjamin Anderson", "Amelia Thomas", "Elijah Taylor", "Harper Moore",
-        "Alexander Jackson", "Evelyn Martin", "Daniel Lee", "Abigail Perez", "Henry Thompson",
-        "Emily White", "Sebastian Harris", "Elizabeth Sanchez", "Jack Clark", "Camila Ramirez",
-        "Owen Lewis", "Ella Robinson", "Samuel Walker", "Avery Young", "Ryan Allen",
-        "Sofia King", "Matthew Wright", "Chloe Scott", "Jackson Torres", "Victoria Nguyen"
-    ]
+        student_names = [
+            "gwen", "Aarav Sharma", "Sophia Chen", "Liam Johnson", "Noah Smith",
+            "Emma Watson", "Lucas Brown", "Olivia Garcia", "Ethan Miller", "Ava Davis",
+            "Mason Rodriguez", "Isabella Martinez", "William Hernandez", "Mia Lopez", "James Gonzalez",
+            "Charlotte Wilson", "Benjamin Anderson", "Amelia Thomas", "Elijah Taylor", "Harper Moore",
+            "Alexander Jackson", "Evelyn Martin", "Daniel Lee", "Abigail Perez", "Henry Thompson",
+            "Emily White", "Sebastian Harris", "Elizabeth Sanchez", "Jack Clark", "Camila Ramirez",
+            "Owen Lewis", "Ella Robinson", "Samuel Walker", "Avery Young", "Ryan Allen",
+            "Sofia King", "Matthew Wright", "Chloe Scott", "Jackson Torres", "Victoria Nguyen",
+        ]
 
-    img_h, img_w = image_rgb.shape[:2]
-    seeded_count = 0
+        img_h, img_w = image_rgb.shape[:2]
+        seeded_count = 0
 
-    # Clean existing students in database for fresh seeding
-    with db.get_conn() as conn:
-        conn.execute("DELETE FROM face_embeddings")
-        conn.execute("DELETE FROM attendance_records")
-        conn.execute("DELETE FROM students")
+        # Clear existing data first (safe here because we confirmed count == 0 above)
+        with db.get_conn() as conn:
+            conn.execute("DELETE FROM face_embeddings")
+            conn.execute("DELETE FROM attendance_records")
+            conn.execute("DELETE FROM students")
 
-    # Special handling for Gwen (student_id = "5")
-    for idx, face in enumerate(faces, start=1):
-        if idx == 5 or idx > len(student_names):
-            sid = "5" if idx == 5 else str(idx)
-            name = "gwen" if idx == 5 else f"Student {idx}"
-        else:
-            sid = str(idx)
-            name = student_names[idx - 1]
+        for idx, face in enumerate(faces, start=1):
+            if idx > len(student_names):
+                name = f"Student {idx}"
+            else:
+                name = student_names[idx - 1]
+            sid   = str(idx)
+            cname = "Grade 10 - Section A" if idx <= 20 else "Grade 10 - Section B"
 
-        cname = "Grade 10 - Section A" if idx <= 20 else "Grade 10 - Section B"
+            if not db.student_exists(sid):
+                db.add_student(sid, name, cname)
 
-        if not db.student_exists(sid):
-            db.add_student(sid, name, cname)
+            # Crop face with padding
+            x1, y1, x2, y2 = face["bbox"]
+            pad     = int(max(x2 - x1, y2 - y1) * 0.3)
+            crop_x1 = max(0, x1 - pad)
+            crop_y1 = max(0, y1 - pad)
+            crop_x2 = min(img_w, x2 + pad)
+            crop_y2 = min(img_h, y2 + pad)
 
-        # Crop face photo with padding
-        x1, y1, x2, y2 = face["bbox"]
-        pad = int(max(x2 - x1, y2 - y1) * 0.3)
-        crop_x1 = max(0, x1 - pad)
-        crop_y1 = max(0, y1 - pad)
-        crop_x2 = min(img_w, x2 + pad)
-        crop_y2 = min(img_h, y2 + pad)
+            face_crop = image_rgb[crop_y1:crop_y2, crop_x1:crop_x2]
+            crop_buf  = io.BytesIO()
+            Image.fromarray(face_crop).save(crop_buf, format="JPEG", quality=95)
 
-        face_crop = image_rgb[crop_y1:crop_y2, crop_x1:crop_x2]
-        s_dir = os.path.join(STUDENT_PHOTO_DIR, sid)
-        os.makedirs(s_dir, exist_ok=True)
-        crop_path = os.path.join(s_dir, "ref_1.jpg")
-        Image.fromarray(face_crop).save(crop_path, "JPEG", quality=95)
+            saved_path = storage.save_photo(crop_buf.getvalue(), f"{sid}/ref_1.jpg", kind="student")
+            db.add_embedding(sid, face["embedding"], saved_path, face["det_score"])
+            seeded_count += 1
 
-        # Store REAL 512-d ArcFace embedding in SQLite database!
-        db.add_embedding(sid, face["embedding"], crop_path, face["det_score"])
-        seeded_count += 1
+        print(f"[SEED] Registered {seeded_count} students with real ArcFace embeddings.")
+        return {
+            "ok": True,
+            "seeded_students": seeded_count,
+            "faces_detected": len(faces),
+        }
 
-        print(f"Successfully registered {seeded_count} real students into database!")
-        return {"ok": True, "seeded_students": seeded_count, "faces_detected": len(faces)}
     except Exception as err:
-        print(f"[SEED ERROR] {err}")
+        import traceback
+        print(f"[SEED ERROR] {err}\n{traceback.format_exc()}")
         return {"ok": False, "error": str(err)}
 
 

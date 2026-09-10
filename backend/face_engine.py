@@ -1,21 +1,30 @@
 """
 face_engine.py
 --------------
-InsightFace ArcFace Flagship Engine (buffalo_l: ResNet50 w600k_r50 + SCRFD 10G)
-for high-accuracy face detection, 5-point alignment, and 512-d feature embedding.
+InsightFace ArcFace engine (buffalo_sc: SCRFD detector + MobileFaceNet ArcFace recognizer)
+for face detection, 5-point alignment, and 512-d feature embedding.
+
+INSIGHTFACE_HOME must be set to /tmp/.insightface before this module is imported
+(handled in api/index.py) so model weights download to the writable /tmp directory
+on Vercel and other read-only serverless environments.
 """
 
+import os
 import io
 import cv2
 import numpy as np
-from PIL import Image, ImageEnhance
-from insightface.app import FaceAnalysis
+from PIL import Image
+
+# Ensure InsightFace uses /tmp for model caching (writable on Vercel).
+# api/index.py sets this before importing, but guard here too for local runs.
+if not os.environ.get("INSIGHTFACE_HOME"):
+    os.environ["INSIGHTFACE_HOME"] = "/tmp/.insightface"
 
 _APP = None
 _INSIGHTFACE_AVAILABLE = False
 
 try:
-    from insightface.app import FaceAnalysis
+    from insightface.app import FaceAnalysis  # noqa: E402
     _INSIGHTFACE_AVAILABLE = True
 except Exception as e:
     print(f"[FACE_ENGINE] InsightFace not available ({e}). Using OpenCV Haar Cascade fallback.")
@@ -23,7 +32,7 @@ except Exception as e:
 
 
 def get_face_app():
-    """Lazily load and cache the InsightFace buffalo_sc model pack if available."""
+    """Lazily load and cache the InsightFace buffalo_sc model pack."""
     global _APP
     if not _INSIGHTFACE_AVAILABLE:
         return None
@@ -53,7 +62,7 @@ def enhance_contrast_if_needed(image_rgb: np.ndarray) -> np.ndarray:
     """Apply adaptive CLAHE contrast enhancement if an image is dark or low contrast."""
     lab = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2LAB)
     l, a, b = cv2.split(lab)
-    
+
     avg_brightness = np.mean(l)
     if avg_brightness < 80 or np.std(l) < 35:
         clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
@@ -65,8 +74,9 @@ def enhance_contrast_if_needed(image_rgb: np.ndarray) -> np.ndarray:
 
 def detect_faces(image_rgb: np.ndarray, det_thresh: float = 0.20):
     """
-    Accelerated SCRFD 10G face detection + 5-point alignment + ResNet50 embedding extraction.
-    Fast CPU viewport scaling (1024px) for sub-second recognition on classroom photos.
+    Face detection + 5-point alignment + ArcFace embedding extraction.
+    Falls back to OpenCV Haar Cascade with placeholder embeddings if InsightFace
+    is unavailable (embeddings will not be useful for recognition in that case).
     """
     import time
     t0 = time.time()
@@ -74,15 +84,16 @@ def detect_faces(image_rgb: np.ndarray, det_thresh: float = 0.20):
     app = get_face_app()
 
     if app is None:
-        # OpenCV Haar Cascade Fallback for serverless/lightweight environments
+        # OpenCV Haar Cascade fallback — warns that recognition quality is degraded
+        print("[FACE_ENGINE] WARNING: Using Haar Cascade fallback. InsightFace unavailable.")
         gray = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY)
-        cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+        cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
         face_cascade = cv2.CascadeClassifier(cascade_path)
         detected = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(30, 30))
-        
+
         results = []
         for (x, y, fw, fh) in detected:
-            crop = image_rgb[y:y+fh, x:x+fw]
+            crop = image_rgb[y:y + fh, x:x + fw]
             if crop.size == 0:
                 continue
             resized = cv2.resize(crop, (16, 16)).astype(np.float32).flatten()
@@ -94,9 +105,9 @@ def detect_faces(image_rgb: np.ndarray, det_thresh: float = 0.20):
             results.append({
                 "bbox": [int(x), int(y), int(x + fw), int(y + fh)],
                 "det_score": 0.95,
-                "embedding": embedding
+                "embedding": embedding,
             })
-        print(f"[FACE_ENGINE] OpenCV fallback detected {len(results)} faces")
+        print(f"[FACE_ENGINE] Haar Cascade detected {len(results)} faces (low-quality embeddings)")
         return results
 
     if hasattr(app, "det_model") and app.det_model is not None:
@@ -118,9 +129,9 @@ def detect_faces(image_rgb: np.ndarray, det_thresh: float = 0.20):
     bgr = det_img_rgb[:, :, ::-1]
     faces = app.get(bgr)
 
-    # Fallback retry with contrast enhancement if no faces found
-    if len(faces) == 0 and det_img_rgb is image_rgb:
-        enhanced_rgb = enhance_contrast_if_needed(image_rgb)
+    # Retry with contrast enhancement if no faces detected
+    if len(faces) == 0:
+        enhanced_rgb = enhance_contrast_if_needed(det_img_rgb)
         bgr = enhanced_rgb[:, :, ::-1]
         faces = app.get(bgr)
 
@@ -136,16 +147,14 @@ def detect_faces(image_rgb: np.ndarray, det_thresh: float = 0.20):
             int(bbox_det[3] * scale_y),
         ]
         embedding = f.normed_embedding.astype(np.float32)
-        results.append(
-            {
-                "bbox": bbox,
-                "det_score": float(f.det_score),
-                "embedding": embedding,
-            }
-        )
+        results.append({
+            "bbox": bbox,
+            "det_score": float(f.det_score),
+            "embedding": embedding,
+        })
 
     t1 = time.time()
-    print(f"[FACE_ENGINE] Detected {len(results)} faces in {(t1-t0)*1000:.1f}ms")
+    print(f"[FACE_ENGINE] Detected {len(results)} faces in {(t1 - t0) * 1000:.1f}ms")
     return results
 
 
@@ -156,9 +165,8 @@ def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
 
 def compute_student_similarities(query_embedding: np.ndarray, gallery: list):
     """
-    gallery: list of {"student_id": str, "name": str, "embedding": np.ndarray}
-    Returns a dict mapping student_id -> {"name": str, "max_score": float}
-    Takes the maximum cosine similarity across all stored face vectors for each student.
+    Returns a dict mapping student_id -> {"name": str, "max_score": float}.
+    Takes the maximum cosine similarity across all stored face vectors per student.
     """
     if not gallery:
         return {}
@@ -173,17 +181,14 @@ def compute_student_similarities(query_embedding: np.ndarray, gallery: list):
 
 def compute_student_similarities_vectorized(query_embeddings: list, gallery: list):
     """
-    Vectorized matrix BLAS dot-product search for 1,000s of student embeddings.
-    M query faces x N gallery vectors matrix multiplication in a single pass.
+    Vectorized matrix dot-product search: M query faces × N gallery vectors in one pass.
     """
     if not query_embeddings or not gallery:
         return [{} for _ in query_embeddings]
 
-    Q = np.vstack([q.reshape(1, -1) for q in query_embeddings])  # Shape (M, 512)
-    G = np.vstack([entry["embedding"].reshape(1, -1) for entry in gallery])  # Shape (N, 512)
-
-    # Compute dot products (M, N)
-    S = np.dot(Q, G.T)
+    Q = np.vstack([q.reshape(1, -1) for q in query_embeddings])   # (M, 512)
+    G = np.vstack([e["embedding"].reshape(1, -1) for e in gallery])  # (N, 512)
+    S = np.dot(Q, G.T)  # (M, N)
 
     results = []
     for face_idx in range(len(query_embeddings)):
@@ -196,4 +201,3 @@ def compute_student_similarities_vectorized(query_embeddings: list, gallery: lis
                 student_scores[sid] = {"name": entry["name"], "max_score": score}
         results.append(student_scores)
     return results
-

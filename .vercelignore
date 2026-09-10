@@ -1,0 +1,30 @@
+# Vercel deployment ignore file
+# Excludes files from the function bundle to stay under the 500 MB limit
+
+# Local SQLite database — never deploy DB file; production uses PostgreSQL
+backend/data/*.db
+backend/data/*.db-journal
+backend/data/*.db-shm
+backend/data/*.db-wal
+
+# Local student/session photos — production uses cloud object storage
+backend/data/student_photos/
+backend/data/session_photos/
+
+# Python cache files
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Development/tooling files
+.git/
+.gitignore
+Dockerfile
+*.md
